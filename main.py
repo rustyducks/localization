@@ -15,6 +15,10 @@ import redis
 import threading
 from numpy import linalg as la
 
+import arucolvert
+
+import threading
+
 
 from math import tan, sin, cos, sqrt, atan2
 
@@ -81,10 +85,14 @@ def normalize_angle(x):
 
 def residual_h(a, b):
     y = a - b
-    # data in format [dist_1, bearing_1, dist_2, bearing_2,...]
-    for i in range(0, len(y), 2):
-        y[i + 1] = normalize_angle(y[i + 1])
-    #print("residual", a, b, y)
+    if len(y) != 3:
+        # Beacon measurement
+        # data in format [dist_1, bearing_1, dist_2, bearing_2,...]
+        for i in range(0, len(y), 2):
+            y[i + 1] = normalize_angle(y[i + 1])
+        #print("residual", a, b, y)
+    else:
+        y[2] = normalize_angle(y[2])
     return y
 
 def residual_x(a, b):
@@ -95,17 +103,20 @@ def residual_x(a, b):
 
 
 
-def Hx(x, landmarks):
+def Hx(x, measure_type, landmarks=None):
     """ takes a state variable and returns the measurement
     that would correspond to that state. """
-    hx = []
-    for lmark in landmarks:
-        px, py = lmark
-        dist = sqrt((px - x[0])**2 + (py - x[1])**2)
-        angle = atan2(py - x[1], px - x[0])
-        hx.extend([dist, normalize_angle(angle - x[2])])
-    #print("hx", hx)
-    return np.array(hx)
+    if measure_type == 0:
+        hx = []
+        for lmark in landmarks:
+            px, py = lmark
+            dist = sqrt((px - x[0])**2 + (py - x[1])**2)
+            angle = atan2(py - x[1], px - x[0])
+            hx.extend([dist, normalize_angle(angle - x[2])])
+        #print("hx", hx)
+        return np.array(hx)
+    elif measure_type == 1:
+        return np.array(x)
 
 
 
@@ -122,13 +133,21 @@ def state_mean(sigmas, Wm):
 def z_mean(sigmas, Wm):
     z_count = sigmas.shape[1]
     x = np.zeros(z_count)
+    if z_count != 3:
+        # Beacon measurement
+        for z in range(0, z_count, 2):
+            sum_sin = np.sum(np.dot(np.sin(sigmas[:, z+1]), Wm))
+            sum_cos = np.sum(np.dot(np.cos(sigmas[:, z+1]), Wm))
 
-    for z in range(0, z_count, 2):
-        sum_sin = np.sum(np.dot(np.sin(sigmas[:, z+1]), Wm))
-        sum_cos = np.sum(np.dot(np.cos(sigmas[:, z+1]), Wm))
-
-        x[z] = np.sum(np.dot(sigmas[:,z], Wm))
-        x[z+1] = normalize_angle(atan2(sum_sin, sum_cos))
+            x[z] = np.sum(np.dot(sigmas[:,z], Wm))
+            x[z+1] = normalize_angle(atan2(sum_sin, sum_cos))
+    else:
+        # Direct pose measurement
+        sum_sin = np.sum(np.dot(np.sin(sigmas[:, 2]), Wm))
+        sum_cos = np.sum(np.dot(np.cos(sigmas[:, 2]), Wm))
+        x[0] = np.sum(np.dot(sigmas[:, 0], Wm))
+        x[1] = np.sum(np.dot(sigmas[:, 1], Wm))
+        x[2] = normalize_angle(atan2(sum_sin, sum_cos))
     return x
 
 
@@ -184,7 +203,16 @@ def on_beacons_measurements(message):
             measurements.extend(list(map(float, m.split(b","))))
     #print("b", beacons)
     ukf.update(measurements, R=np.diag([5 ** 2,
-                     0.05 ** 2] * len(beacons)), landmarks=beacons)
+                     0.05 ** 2] * len(beacons)), measure_type=0, landmarks=beacons)
+
+def arucol_reader_thread(ukf):
+    arucol = arucolvert.ArucolVert("/dev/ttyUSB3", 115200)
+    while not stop:
+        x, y, theta = arucol.next_pose()
+        print("Updating ukf with", x, y, theta)
+        ukf.update(np.array([x, y, theta]), R=np.diag([5 ** 2, 5**2, 0.05**2]), measure_type=1)
+
+
 
 
 dt = 1.0
@@ -212,8 +240,8 @@ def create_ukf(
               z_mean_fn=z_mean, residual_x=residual_x,
               residual_z=residual_h)
 
-    ukf.x = np.array([0., 450., 0.])
-    ukf.P = np.diag([100., 50., .1])
+    ukf.x = np.array([203.0, 1549.2, 1.34])
+    ukf.P = np.diag([100., 100., .5])
     ukf.R = np.diag([sigma_range ** 2,
                      sigma_bearing ** 2] * len(landmarks))
     ukf.Q = np.diag([10.**2, 10.**2, 0.3**2])
@@ -241,7 +269,8 @@ def run_localisation(ukf, landmarks):
     track = []
     while not stop:
         print("epoch:", epoch)
-        print("cov", ukf.P)
+        #print("cov", ukf.P)
+        print("pos:", ukf.x)
         epoch += 1
         ukf.predict()
         track.append((time.time(), ukf.x))
@@ -318,6 +347,9 @@ beacon_redis_sub = beacon_redis.pubsub()
 beacon_redis_sub.subscribe(**{"beacons/measurements": on_beacons_measurements})
 beacon_redis_th = beacon_redis_sub.run_in_thread(sleep_time=0.01)
 
+p = threading.Thread(target=arucol_reader_thread, args=(ukf,))
+p.start()
+
 #pub_th = PubMeasurements(measurements)
 #pub_th.start()
 pose_redis = redis.Redis(host='localhost', port=6379, db=0)
@@ -325,6 +357,7 @@ pose_redis = redis.Redis(host='localhost', port=6379, db=0)
 
 ukf = run_localisation(ukf, landmarks)
 beacon_redis_th.stop()
+p.join()
 print("final postition", ukf.x)
 
 
